@@ -107,3 +107,6 @@ ENV/
 *.jpg
 *.png
 *.csv
+/wandb
+/lightning_logs
+*.zip
