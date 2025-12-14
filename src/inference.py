@@ -4,10 +4,11 @@ from typing import List, Dict, Tuple
 import torch
 import numpy as np
 from tqdm import tqdm
-
-from utils import (
+from collections import defaultdict
+from src.utils.utils import (
     BBoxSample,
     TestBBox,
+    iou_bbox,
     Tracklet,
     load_train_meta,
     build_tracks,
@@ -18,22 +19,83 @@ from utils import (
     build_gallery,
     get_tracklet_embedding,
     compute_cosine_similarity,
+    # add neg samples
+    generate_background_negatives,
+    generate_partial_negatives,
+    # cv label folds
+    make_label_folds
 )
-from pl_module import PlayerReIDModule
+from src.models.pl_module import PlayerReIDModule
 
+def build_open_set_splits_cv(
+    train_meta_path: str,
+    img_root: str,
+    bbox_mode: str,
+    n_folds: int,
+    fold_idx: int,
+    unknown_per_fold: int = 2,
+    cv_seed: int = 42,
+    add_bg_negatives: bool = True,
+    add_partial_negatives: bool = True,
+) -> Tuple[List[BBoxSample], List[BBoxSample], List[int], List[int]]:
+    """
+    Open-set split theo fold:
+      - Với fold_idx: chọn đúng unknown_per_fold labels làm unknown.
+      - Các label còn lại = known.
+      - unknown_samples gồm:
+            + sample của unknown_labels
+            + optional background negatives
+            + optional partial negatives
+    """
+    samples = load_train_meta(train_meta_path, img_root)
+    tracks = build_tracks(samples)
+    cleaned_samples = clean_tracks(tracks, mode=bbox_mode)
+
+    all_labels = sorted({s.label_id for s in cleaned_samples})
+    folds_unknown = make_label_folds(
+        unique_labels=all_labels,
+        n_folds=n_folds,
+        unknown_per_fold=unknown_per_fold,
+        seed=cv_seed,
+    )
+
+    assert 0 <= fold_idx < n_folds
+    unknown_labels = set(folds_unknown[fold_idx])
+    known_labels = [lab for lab in all_labels if lab not in unknown_labels]
+
+    # 1. sample của unknown_labels (player chưa thấy trong train fold này)
+    unknown_player_samples = [s for s in cleaned_samples if s.label_id in unknown_labels]
+    known_samples = [s for s in cleaned_samples if s.label_id in known_labels]
+
+    unknown_samples = list(unknown_player_samples)
+
+    # 2. thêm background negatives
+    if add_bg_negatives:
+        bg_neg = generate_background_negatives(
+            samples=cleaned_samples,
+            num_bg_per_frame=1,
+        )
+        unknown_samples.extend(bg_neg)
+
+    # 3. thêm partial negatives
+    if add_partial_negatives:
+        partial_neg = generate_partial_negatives(
+            samples=cleaned_samples,
+            num_partial_per_box=1,
+            max_iou_with_gt=0.4,
+        )
+        unknown_samples.extend(partial_neg)
+
+    return known_samples, unknown_samples, known_labels, list(unknown_labels)
 
 def build_open_set_splits(
     train_meta_path: str,
     img_root: str,
     bbox_mode: str = "drop",
     unknown_ratio: float = 0.2,
+    add_bg_negatives: bool = True,
+    add_partial_negatives: bool = True,
 ):
-    """
-    Đọc train_meta -> clean -> split label thành known/unknown cho open-set.
-    Trả về:
-      - known_samples (dùng train model + build gallery)
-      - unknown_samples (dùng tune threshold)
-    """
     samples = load_train_meta(train_meta_path, img_root)
     tracks = build_tracks(samples)
     cleaned_samples = clean_tracks(tracks, mode=bbox_mode)
@@ -43,8 +105,28 @@ def build_open_set_splits(
         all_labels, unknown_ratio=unknown_ratio
     )
 
+    # 1. unknown player (label chưa thấy)
+    unknown_player_samples = [s for s in cleaned_samples if s.label_id in unknown_labels]
     known_samples = [s for s in cleaned_samples if s.label_id in known_labels]
-    unknown_samples = [s for s in cleaned_samples if s.label_id in unknown_labels]
+
+    unknown_samples = list(unknown_player_samples)
+
+    # 2. thêm background negatives (không có cầu thủ)
+    if add_bg_negatives:
+        bg_negatives = generate_background_negatives(
+            samples=cleaned_samples,
+            num_bg_per_frame=1,
+        )
+        unknown_samples.extend(bg_negatives)
+
+    # 3. thêm partial negatives (chỉ 1 phần cơ thể)
+    if add_partial_negatives:
+        partial_negatives = generate_partial_negatives(
+            samples=cleaned_samples,
+            num_partial_per_box=1,
+            max_iou_with_gt=0.4,
+        )
+        unknown_samples.extend(partial_negatives)
 
     return known_samples, unknown_samples, known_labels, unknown_labels
 
@@ -98,7 +180,7 @@ def tune_threshold(
     => Đây là demo, bạn có thể làm phức tạp hơn.
     """
     from collections import defaultdict
-    from metric import macro_f1
+    from src.utils.metric import macro_f1
 
     device = torch.device(device)
     pl_module.eval().to(device)
@@ -169,24 +251,32 @@ def tune_threshold(
     return best_T
 
 
+from src.utils.utils import TestBBox, iou_bbox  # nhớ import iou_bbox từ utils.py
+
+
 def enforce_frame_constraint(
     test_bboxes: List[TestBBox],
     label_preds: List[int],
     pred_scores: List[float],
+    iou_same_player: float = 0.5,
 ) -> List[int]:
     """
-    Một ID known chỉ gán cho 1 bbox / frame.
-    Label -1 thì không giới hạn.
+    Rule mới:
+      - Cho phép N bbox cùng label trong 1 frame nếu chúng thuộc cùng "cluster overlap" (IoU >= iou_same_player).
+      - Nếu cùng label nhưng nằm ở nhiều cluster rời rạc -> chỉ giữ cluster có score cao nhất, các cluster khác gán -1.
+      - Label -1 không bị giới hạn.
     """
-    from collections import defaultdict
-
-    groups: Dict[Tuple[str, str, int, int], List[int]] = defaultdict(list)
+    # group indices theo (quarter, angle, session, frame)
+    frame_groups: Dict[Tuple[str, str, int, int], List[int]] = defaultdict(list)
     for b in test_bboxes:
         key = (b.quarter, b.angle, b.session, b.frame)
-        groups[key].append(b.idx)
+        frame_groups[key].append(b.idx)
 
-    for key, idx_list in groups.items():
-        # group theo predicted_label
+    # để access nhanh TestBBox theo idx
+    idx_to_bbox: Dict[int, TestBBox] = {b.idx: b for b in test_bboxes}
+
+    for key, idx_list in frame_groups.items():
+        # group theo predicted label
         label_to_indices: Dict[int, List[int]] = defaultdict(list)
         for idx in idx_list:
             lab = label_preds[idx]
@@ -194,16 +284,61 @@ def enforce_frame_constraint(
 
         for lab, idxs in label_to_indices.items():
             if lab == -1:
+                # unknown không bị ràng buộc
                 continue
             if len(idxs) <= 1:
+                # chỉ 1 bbox mang label này trong frame -> OK
                 continue
-            # giữ bbox có score cao nhất
-            best_idx = max(idxs, key=lambda i: pred_scores[i])
-            for i in idxs:
-                if i != best_idx:
-                    label_preds[i] = -1
+
+            # --- Cluster các bbox theo overlap IoU >= iou_same_player ---
+            # build adjacency graph
+            n = len(idxs)
+            visited = [False] * n
+            clusters: List[List[int]] = []
+
+            for i in range(n):
+                if visited[i]:
+                    continue
+                # BFS/DFS nhỏ để lấy component
+                stack = [i]
+                visited[i] = True
+                comp = [idxs[i]]
+                while stack:
+                    u = stack.pop()
+                    bu = idx_to_bbox[idxs[u]]
+                    for v in range(n):
+                        if visited[v]:
+                            continue
+                        bv = idx_to_bbox[idxs[v]]
+                        if iou_bbox(bu, bv) >= iou_same_player:
+                            visited[v] = True
+                            stack.append(v)
+                            comp.append(idxs[v])
+                clusters.append(comp)
+
+            if len(clusters) <= 1:
+                # chỉ 1 cluster -> tất cả bbox overlap nhau -> giữ hết
+                continue
+
+            # --- chọn cluster có score cao nhất, các cluster khác set -1 ---
+            cluster_scores: List[float] = []
+            for comp in clusters:
+                max_score = max(pred_scores[i] for i in comp)
+                cluster_scores.append(max_score)
+
+            # index cluster giữ lại
+            best_cluster_idx = max(range(len(clusters)), key=lambda ci: cluster_scores[ci])
+            keep_indices = set(clusters[best_cluster_idx])
+
+            for ci, comp in enumerate(clusters):
+                if ci == best_cluster_idx:
+                    continue
+                # drop các bbox trong cluster yếu hơn
+                for idx in comp:
+                    label_preds[idx] = -1
 
     return label_preds
+
 
 
 def run_inference(
@@ -217,6 +352,7 @@ def run_inference(
     device: str = "cuda",
     image_size: int = 224,
     submission_path: str = "submission.csv",
+    logger = None,
 ):
     """
     Pipeline:
@@ -227,20 +363,33 @@ def run_inference(
       5. Enforce frame constraint -> submission.
     """
     # 1. load model
+    if logger:
+        logger.info("\nLoading model from checkpoint...")
+        logger.info(f"Checkpoint: {ckpt_path}")
     device = torch.device(device)
     pl_module = PlayerReIDModule.load_from_checkpoint(ckpt_path)
     pl_module.eval().to(device)
+    if logger:
+        logger.info(f"Model loaded successfully on device: {device}")
 
     # 2. open-set split
+    if logger:
+        logger.info("\nBuilding open-set splits...")
+        logger.info(f"Unknown ratio: {unknown_ratio}")
     known_samples, unknown_samples, known_labels, unknown_labels = build_open_set_splits(
         train_meta_path=train_meta_path,
         img_root=train_img_root,
         bbox_mode=bbox_mode,
         unknown_ratio=unknown_ratio,
     )
+    if logger:
+        logger.info(f"Known samples: {len(known_samples)}, Known labels: {len(known_labels)}")
+        logger.info(f"Unknown samples: {len(unknown_samples)}, Unknown labels: {len(unknown_labels)}")
 
     # 3. build gallery
     known_samples_side = [s for s in known_samples if s.angle == "side"]
+    if logger:
+        logger.info(f"\nBuilding gallery from {len(known_samples_side)} side-angle samples...")
     print("[run_inference] Building gallery...")
     gallery = build_gallery(
         pl_module,
@@ -249,10 +398,17 @@ def run_inference(
         image_size=image_size,
         device=device,
     )
+    if logger:
+        logger.info(f"Gallery built with {len(gallery)} classes")
 
     # 4. build unknown_tracklets để tune threshold
+    if logger:
+        logger.info("\nBuilding unknown tracklets for threshold tuning...")
     print("[run_inference] Building unknown tracklets for threshold tuning...")
     unknown_tracklets = build_val_tracklets_from_unknown(unknown_samples)
+    if logger:
+        logger.info(f"Built {len(unknown_tracklets)} unknown tracklets")
+        logger.info("Tuning threshold...")
     T_unknown = tune_threshold(
         pl_module,
         gallery,
@@ -261,16 +417,26 @@ def run_inference(
         image_size=image_size,
         device=device,
     )
+    if logger:
+        logger.info(f"Best threshold: {T_unknown:.4f}")
 
     # 5. load test_meta & build tracklets
+    if logger:
+        logger.info("\nLoading test metadata and building tracklets...")
     print("[run_inference] Building test tracklets...")
     test_bboxes = load_test_meta(test_meta_path, test_img_root)
+    if logger:
+        logger.info(f"Loaded {len(test_bboxes)} test bounding boxes")
     tracklets = build_test_tracklets(test_bboxes)
+    if logger:
+        logger.info(f"Built {len(tracklets)} test tracklets")
 
     # 6. predict label cho mỗi tracklet
     label_preds = [-1] * len(test_bboxes)
     pred_scores = [0.0] * len(test_bboxes)
 
+    if logger:
+        logger.info("\nPredicting labels for tracklets...")
     print("[run_inference] Predicting labels for tracklets...")
     for tr in tqdm(tracklets):
         emb = get_tracklet_embedding(pl_module, tr, image_size=image_size, device=device)
@@ -293,11 +459,120 @@ def run_inference(
             pred_scores[b.idx] = tr.pred_score
 
     # 7. enforce frame constraint
+    if logger:
+        logger.info("\nEnforcing frame constraint...")
     print("[run_inference] Enforcing frame constraint...")
     label_preds = enforce_frame_constraint(test_bboxes, label_preds, pred_scores)
+    
+    # Count predictions
+    from collections import Counter
+    pred_counts = Counter(label_preds)
+    if logger:
+        logger.info(f"Prediction distribution:")
+        logger.info(f"  - Unknown (-1): {pred_counts.get(-1, 0)} ({pred_counts.get(-1, 0)/len(label_preds)*100:.2f}%)")
+        logger.info(f"  - Known labels: {len(label_preds) - pred_counts.get(-1, 0)} ({(len(label_preds) - pred_counts.get(-1, 0))/len(label_preds)*100:.2f}%)")
+        logger.info(f"  - Unique known labels predicted: {len([k for k in pred_counts.keys() if k != -1])}")
 
     # 8. write submission
+    if logger:
+        logger.info(f"\nWriting submission to {submission_path}")
     print(f"[run_inference] Writing submission to {submission_path}")
+    with open(submission_path, "w") as f:
+        for lab in label_preds:
+            f.write(str(lab) + "\n")
+    if logger:
+        logger.info(f"Submission file created successfully with {len(label_preds)} predictions")
+
+def run_inference_cv(
+    ckpt_path: str,
+    train_meta_path: str,
+    train_img_root: str,
+    test_meta_path: str,
+    test_img_root: str,
+    bbox_mode: str = "drop",
+    n_folds: int = 5,
+    fold_idx: int = 0,
+    unknown_per_fold: int = 2,
+    cv_seed: int = 42,
+    device: str = "cuda",
+    image_size: int = 224,
+    submission_path: str = "submission_fold0.csv",
+):
+    """
+    Inference cho 1 fold cụ thể:
+      - fold_idx xác định 2 label nào là unknown.
+      - Training model fold_idx phải được train bằng PlayerReIDDataModuleCV với cùng fold.
+    """
+    device = torch.device(device)
+    pl_module = PlayerReIDModule.load_from_checkpoint(ckpt_path)
+    pl_module.eval().to(device)
+
+    # 1. open-set split theo fold
+    known_samples, unknown_samples, known_labels, unknown_labels = build_open_set_splits_cv(
+        train_meta_path=train_meta_path,
+        img_root=train_img_root,
+        bbox_mode=bbox_mode,
+        n_folds=n_folds,
+        fold_idx=fold_idx,
+        unknown_per_fold=unknown_per_fold,
+        cv_seed=cv_seed,
+        add_bg_negatives=True,
+        add_partial_negatives=True,
+    )
+
+    # 2. gallery từ known_samples (có thể filter angle=="side" nếu muốn)
+    known_samples_side = [s for s in known_samples if s.angle == "side"]
+    gallery = build_gallery(
+        pl_module,
+        samples=known_samples_side,
+        batch_size=64,
+        image_size=image_size,
+        device=device,
+    )
+
+    # 3. unknown_tracklets cho threshold tuning
+    unknown_tracklets = build_val_tracklets_from_unknown(unknown_samples)
+
+    T_unknown = tune_threshold(
+        pl_module,
+        gallery,
+        known_samples=known_samples_side,
+        unknown_tracklets=unknown_tracklets,
+        image_size=image_size,
+        device=device,
+    )
+
+    # 4. test tracklets
+    test_bboxes = load_test_meta(test_meta_path, test_img_root)
+    tracklets = build_test_tracklets(test_bboxes)
+
+    # 5. predict tracklet labels
+    label_preds = [-1] * len(test_bboxes)
+    pred_scores = [0.0] * len(test_bboxes)
+
+    for tr in tracklets:
+        emb = get_tracklet_embedding(pl_module, tr, image_size=image_size, device=device)
+        best_lab = -1
+        best_sim = -1.0
+        for lab, c in gallery.items():
+            sim = float(compute_cosine_similarity(emb, c))
+            if sim > best_sim:
+                best_sim = sim
+                best_lab = lab
+        if best_sim < T_unknown:
+            tr.pred_label = -1
+        else:
+            tr.pred_label = best_lab
+        tr.pred_score = best_sim
+
+        for b in tr.bboxes:
+            label_preds[b.idx] = tr.pred_label
+            pred_scores[b.idx] = tr.pred_score
+
+    # 6. enforce frame constraint mới (cho phép overlap cùng ID)
+    label_preds = enforce_frame_constraint(test_bboxes, label_preds, pred_scores)
+
+    # 7. viết submission
     with open(submission_path, "w") as f:
         for lab in label_preds:
             f.write(str(lab) + "\n")
