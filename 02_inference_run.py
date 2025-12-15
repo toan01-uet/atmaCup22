@@ -23,7 +23,7 @@ if __name__ == "__main__":
     # Test data uses crops directory (pre-cropped images)
     test_img_root = os.path.join(script_dir, "inputs")
     submission_path = os.path.join(script_dir, "outputs", "submission.csv")
-    ckpt_path = "/app/toanvt7/data_contest/atmaCup22/atmacup22-reid/3t8w0o4d/checkpoints/reid-fold0-epoch=5-val_f1_macro=0.000.ckpt"
+    ckpt_path = "/app/toanvt7/data_contest/atmaCup22/atmacup22-reid/s2cz6vsk/checkpoints/reid-fold0-epoch=5-val_f1_macro=0.000.ckpt"
 
     logger.info(f"Checkpoint path: {ckpt_path}")
     logger.info(f"Train metadata: {train_meta_path}")
@@ -33,8 +33,9 @@ if __name__ == "__main__":
     logger.info(f"Unknown ratio: 0.2")
     logger.info(f"Device: cuda")
     logger.info(f"Image size: 224")
-
-    run_inference(
+    
+    # Run inference and get diagnostics
+    result_info = run_inference(
         ckpt_path=ckpt_path,
         train_meta_path=train_meta_path,
         train_img_root=train_img_root,

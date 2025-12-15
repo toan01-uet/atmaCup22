@@ -35,6 +35,9 @@ python 00_prepare_negatives.py
 # Single GPU training (default)
 python 01_run_cv_train.py
 
+# With Stage 2 multi-view fine-tuning (recommended for mixed-angle data)
+python 01_run_cv_train_with_finetune.py
+
 # Multi-GPU training (DataParallel strategy)
 GPU_DEVICES="0,1,2,3" python 01_run_cv_train.py
 
@@ -48,7 +51,7 @@ python 01_run_train.py
 python 02_inference_run.py
 
 # Multi-GPU inference (parallel batch processing)
-GPU_DEVICES="0,1" python 02_inference_run.py
+GPU_DEVICES="0,1,2,3" python 02_inference_run.py
 ```
 
 ---
@@ -290,9 +293,42 @@ total_loss = (
 )
 ```
 
+**Training Script with Fine-tuning:**
+```bash
+# Train with automatic Stage 2 fine-tuning after each fold
+python 01_run_cv_train.py
+```
+
+Or use the dedicated script:
+```bash
+# More control over fine-tuning parameters
+python 01_run_cv_train_with_finetune.py
+```
+
+**Fine-tuning Configuration:**
+```python
+# In 01_run_cv_train_with_finetune.py
+ENABLE_FINETUNE = True  # Set to False to skip Stage 2
+FINETUNE_EPOCHS = 5
+FINETUNE_LR = 3e-5  # Much lower than Stage 1
+FINETUNE_CONSISTENCY_WEIGHT = 0.1
+```
+
+**How it works:**
+1. After Stage 1 training completes for a fold, the best checkpoint is loaded
+2. Multi-view pairs are built from training data (side+top views of same player)
+3. Model is fine-tuned with lower learning rate (3e-5 vs 1e-4)
+4. Consistency loss encourages similar embeddings across views
+5. Separate checkpoints saved: `reid-fold{i}-finetuned-epoch-{val_f1}.ckpt`
+
+**Benefits:**
+- Improves cross-angle matching (side ↔ top)
+- Better generalization to mixed-angle test data
+- Minimal overhead (5 epochs, ~5-10 minutes per fold)
+
 **Hyperparameters:**
-- Epochs: 3-5
-- Learning Rate: 3e-5 (very small)
+- Epochs: 3-5 (Stage 1), 3-5 (Stage 2)
+- Learning Rate: 1e-4 (Stage 1) → 3e-5 (Stage 2) (very small)
 - Loss Weights: Side=1.0, Top=0.5, Consistency=0.1
 
 **Why Stage 2 is Optional:**
