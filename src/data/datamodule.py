@@ -222,6 +222,8 @@ class PlayerReIDDataModuleCV(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             drop_last=True,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
         )
 
     def val_dataloader(self):
@@ -239,6 +241,8 @@ class PlayerReIDDataModuleCV(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
         )
         
 class PlayerReIDDataModule(pl.LightningDataModule):
@@ -415,6 +419,8 @@ class PlayerReIDDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             drop_last=True,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
         )
 
     def val_dataloader(self):
@@ -432,4 +438,7 @@ class PlayerReIDDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
         )
+

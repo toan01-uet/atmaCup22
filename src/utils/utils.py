@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
+from collections import defaultdict
 import random
 
 import numpy as np
@@ -688,3 +689,47 @@ def make_label_folds(
         folds_unknown.append(labels[start:end])  # 2 label / fold
 
     return folds_unknown
+
+
+def load_negatives_from_csv(neg_csv_path: str) -> List[BBoxSample]:
+    """
+    Load pre-computed negative samples from CSV file.
+    This is much faster than generating negatives on-the-fly during training.
+    
+    Args:
+        neg_csv_path: Path to CSV file containing negative samples
+        
+    Returns:
+        List of BBoxSample with label_id=-1 (unknown/negative)
+        
+    Usage:
+        # After running 00_prepare_negatives.py:
+        negatives = load_negatives_from_csv("inputs/train_negatives.csv")
+        unknown_samples.extend(negatives)
+    """
+    if not os.path.exists(neg_csv_path):
+        raise FileNotFoundError(
+            f"Negatives CSV not found: {neg_csv_path}\n"
+            f"Please run: python 00_prepare_negatives.py first"
+        )
+    
+    df = pd.read_csv(neg_csv_path)
+    samples = []
+    
+    for _, row in df.iterrows():
+        samples.append(
+            BBoxSample(
+                quarter=str(row["quarter"]),
+                angle=str(row["angle"]),
+                session=int(row["session"]),
+                frame=int(row["frame"]),
+                x=int(row["x"]),
+                y=int(row["y"]),
+                w=int(row["w"]),
+                h=int(row["h"]),
+                label_id=int(row["label_id"]),  # Should be -1
+                img_path=str(row["img_path"]),
+            )
+        )
+    
+    return samples

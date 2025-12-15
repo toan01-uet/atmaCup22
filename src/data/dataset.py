@@ -1,5 +1,6 @@
 from typing import List, Callable, Optional, Tuple
 import os
+from functools import lru_cache
 
 import torch
 from torch.utils.data import Dataset
@@ -130,3 +131,60 @@ class MultiViewPlayerReIDDataset(Dataset):
             crop_top = self.transform(crop_top)
 
         return crop_side, crop_top, torch.tensor(label, dtype=torch.long)
+
+
+class CroppedBBoxDataset(Dataset):
+    """
+    Optimized dataset for pre-cropped images.
+    Use this when you already have cropped bbox images saved as files.
+    Much faster than PlayerReIDDataset as it avoids:
+      - Loading full resolution images
+      - Runtime cropping operations
+    """
+
+    def __init__(
+        self,
+        img_paths: List[str],    # list of paths to cropped images
+        labels: List[int],       # corresponding labels (same length as img_paths)
+        transform: Optional[Callable] = None,
+        use_cache: bool = False,  # Enable LRU cache for frequently accessed images
+        cache_size: int = 10000,  # Max number of images to cache in memory
+    ):
+        """
+        Args:
+            img_paths: List of file paths to pre-cropped images
+            labels: List of label IDs (must be same length as img_paths)
+            transform: Transform pipeline to apply to loaded images
+            use_cache: Whether to use LRU cache for image loading
+            cache_size: Maximum number of images to keep in cache
+        """
+        assert len(img_paths) == len(labels), "img_paths and labels must have same length"
+        self.img_paths = img_paths
+        self.labels = labels
+        self.transform = transform
+        self.use_cache = use_cache
+        
+        # Setup cache if enabled
+        if self.use_cache:
+            self._load_image_cached = lru_cache(maxsize=cache_size)(self._load_image_impl)
+        else:
+            self._load_image_cached = self._load_image_impl
+
+    def __len__(self) -> int:
+        return len(self.img_paths)
+
+    def _load_image_impl(self, path: str) -> Image.Image:
+        """Actual image loading implementation"""
+        return Image.open(path).convert("RGB")
+
+    def __getitem__(self, idx: int):
+        path = self.img_paths[idx]
+        label = self.labels[idx]
+        
+        # Load image (with or without cache depending on use_cache flag)
+        img = self._load_image_cached(path)
+        
+        if self.transform is not None:
+            img = self.transform(img)
+        
+        return img, torch.tensor(label, dtype=torch.long)

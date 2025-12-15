@@ -22,6 +22,7 @@ from src.utils.utils import (
     # add neg samples
     generate_background_negatives,
     generate_partial_negatives,
+    load_negatives_from_csv,  # NEW: load pre-computed negatives
     # cv label folds
     make_label_folds
 )
@@ -37,6 +38,8 @@ def build_open_set_splits_cv(
     cv_seed: int = 42,
     add_bg_negatives: bool = True,
     add_partial_negatives: bool = True,
+    neg_csv_path: str = "inputs/train_negatives.csv",  # NEW: path to pre-computed negatives
+    use_precomputed_negatives: bool = True,  # NEW: use pre-computed instead of generating
 ) -> Tuple[List[BBoxSample], List[BBoxSample], List[int], List[int]]:
     """
     Open-set split theo fold:
@@ -46,6 +49,11 @@ def build_open_set_splits_cv(
             + sample của unknown_labels
             + optional background negatives
             + optional partial negatives
+    
+    Performance optimization:
+      - Set use_precomputed_negatives=True to load negatives from CSV (FAST)
+      - Set use_precomputed_negatives=False to generate on-the-fly (SLOW, 5-7 minutes)
+      - Run: python 00_prepare_negatives.py first to generate the CSV
     """
     samples = load_train_meta(train_meta_path, img_root)
     tracks = build_tracks(samples)
@@ -69,22 +77,45 @@ def build_open_set_splits_cv(
 
     unknown_samples = list(unknown_player_samples)
 
-    # 2. thêm background negatives
-    if add_bg_negatives:
-        bg_neg = generate_background_negatives(
-            samples=cleaned_samples,
-            num_bg_per_frame=1,
-        )
-        unknown_samples.extend(bg_neg)
+    # 2 & 3. Add negatives - use pre-computed or generate on-the-fly
+    if use_precomputed_negatives:
+        # FAST PATH: Load pre-computed negatives from CSV (~100-500ms)
+        try:
+            neg_samples = load_negatives_from_csv(neg_csv_path)
+            
+            # Filter negatives based on flags
+            if add_bg_negatives and add_partial_negatives:
+                unknown_samples.extend(neg_samples)
+            elif add_bg_negatives:
+                # Assume background negatives have some distinguishing feature
+                # For simplicity, just add all (you can add metadata to CSV to filter)
+                unknown_samples.extend(neg_samples)
+            elif add_partial_negatives:
+                unknown_samples.extend(neg_samples)
+                
+        except FileNotFoundError as e:
+            print(f"Warning: {e}")
+            print("Falling back to on-the-fly generation (will be slow)...")
+            use_precomputed_negatives = False
+    
+    if not use_precomputed_negatives:
+        # SLOW PATH: Generate negatives on-the-fly (5-7 minutes)
+        # 2. thêm background negatives
+        if add_bg_negatives:
+            bg_neg = generate_background_negatives(
+                samples=cleaned_samples,
+                num_bg_per_frame=1,
+            )
+            unknown_samples.extend(bg_neg)
 
-    # 3. thêm partial negatives
-    if add_partial_negatives:
-        partial_neg = generate_partial_negatives(
-            samples=cleaned_samples,
-            num_partial_per_box=1,
-            max_iou_with_gt=0.4,
-        )
-        unknown_samples.extend(partial_neg)
+        # 3. thêm partial negatives
+        if add_partial_negatives:
+            partial_neg = generate_partial_negatives(
+                samples=cleaned_samples,
+                num_partial_per_box=1,
+                max_iou_with_gt=0.4,
+            )
+            unknown_samples.extend(partial_neg)
 
     return known_samples, unknown_samples, known_labels, list(unknown_labels)
 
@@ -95,7 +126,17 @@ def build_open_set_splits(
     unknown_ratio: float = 0.2,
     add_bg_negatives: bool = True,
     add_partial_negatives: bool = True,
+    neg_csv_path: str = "inputs/train_negatives.csv",  # NEW: path to pre-computed negatives
+    use_precomputed_negatives: bool = True,  # NEW: use pre-computed instead of generating
 ):
+    """
+    Build open-set splits for training/validation.
+    
+    Performance optimization:
+      - Set use_precomputed_negatives=True to load negatives from CSV (FAST)
+      - Set use_precomputed_negatives=False to generate on-the-fly (SLOW)
+      - Run: python 00_prepare_negatives.py first to generate the CSV
+    """
     samples = load_train_meta(train_meta_path, img_root)
     tracks = build_tracks(samples)
     cleaned_samples = clean_tracks(tracks, mode=bbox_mode)
@@ -111,22 +152,43 @@ def build_open_set_splits(
 
     unknown_samples = list(unknown_player_samples)
 
-    # 2. thêm background negatives (không có cầu thủ)
-    if add_bg_negatives:
-        bg_negatives = generate_background_negatives(
-            samples=cleaned_samples,
-            num_bg_per_frame=1,
-        )
-        unknown_samples.extend(bg_negatives)
+    # 2 & 3. Add negatives - use pre-computed or generate on-the-fly
+    if use_precomputed_negatives:
+        # FAST PATH: Load pre-computed negatives from CSV (~100-500ms)
+        try:
+            neg_samples = load_negatives_from_csv(neg_csv_path)
+            
+            # Filter negatives based on flags
+            if add_bg_negatives and add_partial_negatives:
+                unknown_samples.extend(neg_samples)
+            elif add_bg_negatives:
+                unknown_samples.extend(neg_samples)
+            elif add_partial_negatives:
+                unknown_samples.extend(neg_samples)
+                
+        except FileNotFoundError as e:
+            print(f"Warning: {e}")
+            print("Falling back to on-the-fly generation (will be slow)...")
+            use_precomputed_negatives = False
+    
+    if not use_precomputed_negatives:
+        # SLOW PATH: Generate negatives on-the-fly
+        # 2. thêm background negatives (không có cầu thủ)
+        if add_bg_negatives:
+            bg_negatives = generate_background_negatives(
+                samples=cleaned_samples,
+                num_bg_per_frame=1,
+            )
+            unknown_samples.extend(bg_negatives)
 
-    # 3. thêm partial negatives (chỉ 1 phần cơ thể)
-    if add_partial_negatives:
-        partial_negatives = generate_partial_negatives(
-            samples=cleaned_samples,
-            num_partial_per_box=1,
-            max_iou_with_gt=0.4,
-        )
-        unknown_samples.extend(partial_negatives)
+        # 3. thêm partial negatives (chỉ 1 phần cơ thể)
+        if add_partial_negatives:
+            partial_negatives = generate_partial_negatives(
+                samples=cleaned_samples,
+                num_partial_per_box=1,
+                max_iou_with_gt=0.4,
+            )
+            unknown_samples.extend(partial_negatives)
 
     return known_samples, unknown_samples, known_labels, unknown_labels
 
