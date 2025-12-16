@@ -187,6 +187,142 @@ def split_labels_by_ratio(label_ids: List[int],
     return train_labels, val_labels
 
 
+def split_samples_by_ratio_per_label(
+    samples: List[BBoxSample],
+    train_ratio: float = 0.8,
+    seed: int = 42
+) -> Tuple[List[BBoxSample], List[BBoxSample]]:
+    """
+    Split samples into train/val while maintaining representation from each label.
+    For each label, split its samples according to train_ratio.
+    This ensures both train and val sets contain all labels.
+    """
+    from collections import defaultdict
+    
+    samples_by_label = defaultdict(list)
+    for s in samples:
+        samples_by_label[s.label_id].append(s)
+    
+    train_samples = []
+    val_samples = []
+    
+    rng = random.Random(seed)
+    for label_id, label_samples in samples_by_label.items():
+        # Shuffle samples for this label
+        shuffled = label_samples.copy()
+        rng.shuffle(shuffled)
+        
+        n_train = int(len(shuffled) * train_ratio)
+        train_samples.extend(shuffled[:n_train])
+        val_samples.extend(shuffled[n_train:])
+    
+    return train_samples, val_samples
+
+
+def save_fold_metadata(
+    fold_idx: int,
+    train_samples: List[BBoxSample],
+    val_samples: List[BBoxSample],
+    unknown_labels: List[int],
+    output_dir: str
+) -> None:
+    """
+    Save fold metadata (train/val samples and unknown labels) to CSV files.
+    This ensures consistency between training and inference.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save train samples
+    train_df = pd.DataFrame([
+        {
+            'quarter': s.quarter,
+            'angle': s.angle,
+            'session': s.session,
+            'frame': s.frame,
+            'x': s.x,
+            'y': s.y,
+            'w': s.w,
+            'h': s.h,
+            'label_id': s.label_id,
+            'img_path': s.img_path
+        }
+        for s in train_samples
+    ])
+    train_df.to_csv(os.path.join(output_dir, f'fold{fold_idx}_train_samples.csv'), index=False)
+    
+    # Save val samples
+    val_df = pd.DataFrame([
+        {
+            'quarter': s.quarter,
+            'angle': s.angle,
+            'session': s.session,
+            'frame': s.frame,
+            'x': s.x,
+            'y': s.y,
+            'w': s.w,
+            'h': s.h,
+            'label_id': s.label_id,
+            'img_path': s.img_path
+        }
+        for s in val_samples
+    ])
+    val_df.to_csv(os.path.join(output_dir, f'fold{fold_idx}_val_samples.csv'), index=False)
+    
+    # Save unknown labels
+    unknown_df = pd.DataFrame({'label_id': unknown_labels})
+    unknown_df.to_csv(os.path.join(output_dir, f'fold{fold_idx}_unknown_labels.csv'), index=False)
+
+
+def load_fold_metadata(
+    fold_idx: int,
+    output_dir: str
+) -> Tuple[List[BBoxSample], List[BBoxSample], List[int]]:
+    """
+    Load fold metadata from saved CSV files.
+    """
+    # Load train samples
+    train_df = pd.read_csv(os.path.join(output_dir, f'fold{fold_idx}_train_samples.csv'))
+    train_samples = [
+        BBoxSample(
+            quarter=str(row['quarter']),
+            angle=str(row['angle']),
+            session=int(row['session']),
+            frame=int(row['frame']),
+            x=int(row['x']),
+            y=int(row['y']),
+            w=int(row['w']),
+            h=int(row['h']),
+            label_id=int(row['label_id']),
+            img_path=str(row['img_path'])
+        )
+        for _, row in train_df.iterrows()
+    ]
+    
+    # Load val samples
+    val_df = pd.read_csv(os.path.join(output_dir, f'fold{fold_idx}_val_samples.csv'))
+    val_samples = [
+        BBoxSample(
+            quarter=str(row['quarter']),
+            angle=str(row['angle']),
+            session=int(row['session']),
+            frame=int(row['frame']),
+            x=int(row['x']),
+            y=int(row['y']),
+            w=int(row['w']),
+            h=int(row['h']),
+            label_id=int(row['label_id']),
+            img_path=str(row['img_path'])
+        )
+        for _, row in val_df.iterrows()
+    ]
+    
+    # Load unknown labels
+    unknown_df = pd.read_csv(os.path.join(output_dir, f'fold{fold_idx}_unknown_labels.csv'))
+    unknown_labels = unknown_df['label_id'].tolist()
+    
+    return train_samples, val_samples, unknown_labels
+
+
 # ========== OPEN-SET SPLIT ==========
 
 def split_labels_open_set(

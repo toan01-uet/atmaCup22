@@ -10,7 +10,8 @@ from src.utils.utils import (
     load_train_meta,
     build_tracks,
     clean_tracks,
-    split_labels_by_ratio,
+    split_samples_by_ratio_per_label,
+    save_fold_metadata,
     BBoxSample,
     make_label_folds
 )
@@ -65,6 +66,12 @@ class PlayerReIDDataModuleCV(pl.LightningDataModule):
             self.cache_dir = os.path.join(script_dir, "inputs", "train_crops_cache")
         else:
             self.cache_dir = cache_dir
+        
+        # Fold metadata directory
+        self.fold_meta_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "outputs", "fold_metadata"
+        )
 
         self.train_samples: Optional[List[BBoxSample]] = None
         self.val_samples: Optional[List[BBoxSample]] = None
@@ -115,31 +122,36 @@ class PlayerReIDDataModuleCV(pl.LightningDataModule):
         if self.logger_obj:
             self.logger_obj.info(f"Known labels for training: {len(known_labels)}")
 
-        # 5. split known_labels thành train_labels + val_labels (vẫn cần val monitor F1)
+        # 5. Filter samples to keep only known labels
+        known_samples = [s for s in cleaned_samples if s.label_id in known_labels]
         if self.logger_obj:
-            self.logger_obj.info(f"Splitting known labels with train_ratio={self.train_ratio}...")
-        train_labels, val_labels = split_labels_by_ratio(
-            known_labels, train_ratio=self.train_ratio
+            self.logger_obj.info(f"Known samples (before split): {len(known_samples)}")
+
+        # 6. Split known_samples into train/val at SAMPLE level (not label level)
+        #    This ensures both train and val contain all known labels
+        if self.logger_obj:
+            self.logger_obj.info(f"Splitting known samples with train_ratio={self.train_ratio}...")
+        train_samples_raw, val_samples_raw = split_samples_by_ratio_per_label(
+            known_samples, 
+            train_ratio=self.train_ratio, 
+            seed=self.cv_seed
         )
         if self.logger_obj:
-            self.logger_obj.info(f"Train labels: {len(train_labels)}, Val labels: {len(val_labels)}")
+            self.logger_obj.info(f"Train samples: {len(train_samples_raw)}, Val samples: {len(val_samples_raw)}")
 
-        # 6. Create label remapping to contiguous range [0, num_classes-1]
-        all_used_labels = sorted(set(train_labels + val_labels))
+        # 7. Create label remapping to contiguous range [0, num_classes-1]
+        all_used_labels = sorted(known_labels)
         label_to_idx = {label: idx for idx, label in enumerate(all_used_labels)}
         
         if self.logger_obj:
             self.logger_obj.info(f"Created label mapping: {len(label_to_idx)} labels -> [0, {len(label_to_idx)-1}]")
         
-        # 7. Remap label_ids in samples to contiguous indices
+        # 8. Remap label_ids in samples to contiguous indices
         def remap_sample(s: BBoxSample) -> BBoxSample:
             from dataclasses import replace
             return replace(s, label_id=label_to_idx[s.label_id])
         
-        train_samples_raw = [s for s in cleaned_samples if s.label_id in train_labels]
-        val_samples_raw = [s for s in cleaned_samples if s.label_id in val_labels]
-        
-        # 8. Prepare crop cache if enabled
+        # 9. Prepare crop cache if enabled
         if self.use_crop_cache:
             if self.logger_obj:
                 cache_stats = get_cache_stats(self.cache_dir)
@@ -177,6 +189,20 @@ class PlayerReIDDataModuleCV(pl.LightningDataModule):
             self.logger_obj.info(f"  - Val samples: {len(self.val_samples)}")
             self.logger_obj.info(f"  - Number of classes: {self.num_classes}")
             self.logger_obj.info(f"  - Label range: [0, {self.num_classes-1}]")
+        
+        # Save fold metadata for inference consistency
+        # Save with ORIGINAL label_ids (before remapping) for inference
+        if self.logger_obj:
+            self.logger_obj.info(f"Saving fold metadata to {self.fold_meta_dir}...")
+        save_fold_metadata(
+            fold_idx=self.fold_idx,
+            train_samples=train_samples_raw,  # Original labels
+            val_samples=val_samples_raw,      # Original labels
+            unknown_labels=self.unknown_labels_this_fold,
+            output_dir=self.fold_meta_dir
+        )
+        if self.logger_obj:
+            self.logger_obj.info(f"Fold metadata saved successfully")
 
     def _build_transforms(self, is_train: bool = True):
         if is_train:

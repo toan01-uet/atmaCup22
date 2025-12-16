@@ -13,183 +13,77 @@ from src.utils.utils import (
     load_train_meta,
     build_tracks,
     clean_tracks,
-    split_labels_open_set,
     load_test_meta,
     build_test_tracklets,
     build_gallery,
     get_tracklet_embedding,
     compute_cosine_similarity,
     # add neg samples
-    generate_background_negatives,
-    generate_partial_negatives,
-    load_negatives_from_csv,  # NEW: load pre-computed negatives
-    # cv label folds
-    make_label_folds
+    load_negatives_from_csv,
+    # cv fold metadata
+    load_fold_metadata
 )
 from src.models.pl_module import PlayerReIDModule
 
 def build_open_set_splits_cv(
-    train_meta_path: str,
-    img_root: str,
-    bbox_mode: str,
-    n_folds: int,
     fold_idx: int,
-    unknown_per_fold: int = 2,
-    cv_seed: int = 42,
-    add_bg_negatives: bool = True,
-    add_partial_negatives: bool = True,
-    neg_csv_path: str = "inputs/train_negatives.csv",  # NEW: path to pre-computed negatives
-    use_precomputed_negatives: bool = True,  # NEW: use pre-computed instead of generating
+    fold_meta_dir: str = "outputs/fold_metadata",
+    neg_csv_path: str = "inputs/train_negatives.csv",
+    add_negatives: bool = True,
 ) -> Tuple[List[BBoxSample], List[BBoxSample], List[int], List[int]]:
     """
-    Open-set split theo fold:
-      - Với fold_idx: chọn đúng unknown_per_fold labels làm unknown.
-      - Các label còn lại = known.
-      - unknown_samples gồm:
-            + sample của unknown_labels
-            + optional background negatives
-            + optional partial negatives
+    Build open-set splits for CV fold using SAVED fold metadata from training.
+    This ensures 100% consistency between train and inference.
     
-    Performance optimization:
-      - Set use_precomputed_negatives=True to load negatives from CSV (FAST)
-      - Set use_precomputed_negatives=False to generate on-the-fly (SLOW, 5-7 minutes)
-      - Run: python 00_prepare_negatives.py first to generate the CSV
+    Args:
+        fold_idx: Index of the fold
+        fold_meta_dir: Directory containing saved fold metadata
+        neg_csv_path: Path to pre-computed negatives CSV
+        add_negatives: Whether to add background/partial negatives to unknown samples
+    
+    Returns:
+        known_samples: Training samples (train + val combined) for building gallery
+        unknown_samples: Unknown player samples + negatives for threshold tuning
+        known_labels: List of known label IDs
+        unknown_labels: List of unknown label IDs
     """
-    samples = load_train_meta(train_meta_path, img_root)
-    tracks = build_tracks(samples)
-    cleaned_samples = clean_tracks(tracks, mode=bbox_mode)
-
-    all_labels = sorted({s.label_id for s in cleaned_samples})
-    folds_unknown = make_label_folds(
-        unique_labels=all_labels,
-        n_folds=n_folds,
-        unknown_per_fold=unknown_per_fold,
-        seed=cv_seed,
+    import os
+    
+    # Load saved fold metadata
+    train_samples, val_samples, unknown_labels = load_fold_metadata(
+        fold_idx=fold_idx,
+        output_dir=fold_meta_dir
     )
-
-    assert 0 <= fold_idx < n_folds
-    unknown_labels = set(folds_unknown[fold_idx])
-    known_labels = [lab for lab in all_labels if lab not in unknown_labels]
-
-    # 1. sample của unknown_labels (player chưa thấy trong train fold này)
+    
+    # Combine train and val samples as "known" for building gallery
+    known_samples = train_samples + val_samples
+    
+    # Get known labels
+    known_labels = sorted({s.label_id for s in known_samples})
+    
+    # Build unknown samples: start with unknown player samples
+    # We need to load all cleaned samples to get unknown player samples
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    train_meta_path = os.path.join(script_dir, "inputs", "atmaCup22_2nd", "train_meta.csv")
+    img_root = os.path.join(script_dir, "inputs", "atmaCup22_2nd", "crops")
+    
+    all_samples = load_train_meta(train_meta_path, img_root)
+    tracks = build_tracks(all_samples)
+    cleaned_samples = clean_tracks(tracks, mode="drop")
+    
+    # Get unknown player samples
     unknown_player_samples = [s for s in cleaned_samples if s.label_id in unknown_labels]
-    known_samples = [s for s in cleaned_samples if s.label_id in known_labels]
-
     unknown_samples = list(unknown_player_samples)
-
-    # 2 & 3. Add negatives - use pre-computed or generate on-the-fly
-    if use_precomputed_negatives:
-        # FAST PATH: Load pre-computed negatives from CSV (~100-500ms)
+    
+    # Add pre-computed negatives
+    if add_negatives:
         try:
             neg_samples = load_negatives_from_csv(neg_csv_path)
-            
-            # Filter negatives based on flags
-            if add_bg_negatives and add_partial_negatives:
-                unknown_samples.extend(neg_samples)
-            elif add_bg_negatives:
-                # Assume background negatives have some distinguishing feature
-                # For simplicity, just add all (you can add metadata to CSV to filter)
-                unknown_samples.extend(neg_samples)
-            elif add_partial_negatives:
-                unknown_samples.extend(neg_samples)
-                
+            unknown_samples.extend(neg_samples)
         except FileNotFoundError as e:
-            print(f"Warning: {e}")
-            print("Falling back to on-the-fly generation (will be slow)...")
-            use_precomputed_negatives = False
+            print(f"Warning: Could not load negatives from {neg_csv_path}: {e}")
+            print("Continuing without negative samples...")
     
-    if not use_precomputed_negatives:
-        # SLOW PATH: Generate negatives on-the-fly (5-7 minutes)
-        # 2. thêm background negatives
-        if add_bg_negatives:
-            bg_neg = generate_background_negatives(
-                samples=cleaned_samples,
-                num_bg_per_frame=1,
-            )
-            unknown_samples.extend(bg_neg)
-
-        # 3. thêm partial negatives
-        if add_partial_negatives:
-            partial_neg = generate_partial_negatives(
-                samples=cleaned_samples,
-                num_partial_per_box=1,
-                max_iou_with_gt=0.4,
-            )
-            unknown_samples.extend(partial_neg)
-
-    return known_samples, unknown_samples, known_labels, list(unknown_labels)
-
-def build_open_set_splits(
-    train_meta_path: str,
-    img_root: str,
-    bbox_mode: str = "drop",
-    unknown_ratio: float = 0.2,
-    add_bg_negatives: bool = True,
-    add_partial_negatives: bool = True,
-    neg_csv_path: str = "inputs/train_negatives.csv",  # NEW: path to pre-computed negatives
-    use_precomputed_negatives: bool = True,  # NEW: use pre-computed instead of generating
-):
-    """
-    Build open-set splits for training/validation.
-    
-    Performance optimization:
-      - Set use_precomputed_negatives=True to load negatives from CSV (FAST)
-      - Set use_precomputed_negatives=False to generate on-the-fly (SLOW)
-      - Run: python 00_prepare_negatives.py first to generate the CSV
-    """
-    samples = load_train_meta(train_meta_path, img_root)
-    tracks = build_tracks(samples)
-    cleaned_samples = clean_tracks(tracks, mode=bbox_mode)
-
-    all_labels = [s.label_id for s in cleaned_samples]
-    known_labels, unknown_labels = split_labels_open_set(
-        all_labels, unknown_ratio=unknown_ratio
-    )
-
-    # 1. unknown player (label chưa thấy)
-    unknown_player_samples = [s for s in cleaned_samples if s.label_id in unknown_labels]
-    known_samples = [s for s in cleaned_samples if s.label_id in known_labels]
-
-    unknown_samples = list(unknown_player_samples)
-
-    # 2 & 3. Add negatives - use pre-computed or generate on-the-fly
-    if use_precomputed_negatives:
-        # FAST PATH: Load pre-computed negatives from CSV (~100-500ms)
-        try:
-            neg_samples = load_negatives_from_csv(neg_csv_path)
-            
-            # Filter negatives based on flags
-            if add_bg_negatives and add_partial_negatives:
-                unknown_samples.extend(neg_samples)
-            elif add_bg_negatives:
-                unknown_samples.extend(neg_samples)
-            elif add_partial_negatives:
-                unknown_samples.extend(neg_samples)
-                
-        except FileNotFoundError as e:
-            print(f"Warning: {e}")
-            print("Falling back to on-the-fly generation (will be slow)...")
-            use_precomputed_negatives = False
-    
-    if not use_precomputed_negatives:
-        # SLOW PATH: Generate negatives on-the-fly
-        # 2. thêm background negatives (không có cầu thủ)
-        if add_bg_negatives:
-            bg_negatives = generate_background_negatives(
-                samples=cleaned_samples,
-                num_bg_per_frame=1,
-            )
-            unknown_samples.extend(bg_negatives)
-
-        # 3. thêm partial negatives (chỉ 1 phần cơ thể)
-        if add_partial_negatives:
-            partial_negatives = generate_partial_negatives(
-                samples=cleaned_samples,
-                num_partial_per_box=1,
-                max_iou_with_gt=0.4,
-            )
-            unknown_samples.extend(partial_negatives)
-
     return known_samples, unknown_samples, known_labels, unknown_labels
 
 
