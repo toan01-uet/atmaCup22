@@ -72,9 +72,9 @@ def prepare_crop_cache(
     samples = load_train_meta(train_meta_path, img_root)
     print(f"Loaded {len(samples)} samples")
     
-    # Filter to side angle only (like in training)
-    samples = [s for s in samples if s.angle == "side"]
-    print(f"Filtered to {len(samples)} side-angle samples")
+    # NOTE: Cache all angles (both side and top) to support training
+    # Training script may filter by angle later, but we cache everything
+    print(f"Caching all angles (side and top)")
     
     # Build and clean tracks
     print("\nBuilding and cleaning tracks...")

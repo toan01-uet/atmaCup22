@@ -3,6 +3,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 from pathlib import Path
+import torch
 
 from src.data.datamodule import PlayerReIDDataModuleCV
 from src.models.pl_module import PlayerReIDModule
@@ -30,6 +31,13 @@ Usage:
 """
 
 def run():
+    # Set PyTorch memory management for better GPU utilization
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
+    # Clear GPU cache at start
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     # Convert to absolute paths to avoid path issues
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
@@ -54,14 +62,20 @@ def run():
     UNKNOWN_PER_FOLD = 2
     CV_SEED = 42
     
+    # Memory-optimized configuration
+    BATCH_SIZE = 32  # Reduced from 64 to reduce memory usage
+    NUM_WORKERS = 4  # Reduced from 8 to reduce memory overhead
+    ACCUMULATE_GRAD_BATCHES = 2  # Effective batch size = 32 * 2 = 64
+    
     logger.info(f"\nCross-Validation Configuration:")
     logger.info(f"  - Number of folds: {N_FOLDS}")
     logger.info(f"  - Unknown labels per fold: {UNKNOWN_PER_FOLD}")
     logger.info(f"  - CV seed: {CV_SEED}")
-    logger.info(f"  - Batch size: 64")
-    logger.info(f"  - Num workers: 8")
+    logger.info(f"  - Batch size: {BATCH_SIZE} (effective: {BATCH_SIZE * ACCUMULATE_GRAD_BATCHES} with accumulation)")
+    logger.info(f"  - Num workers: {NUM_WORKERS}")
     logger.info(f"  - Image size: 224")
     logger.info(f"  - BBox mode: drop")
+    logger.info(f"  - Mixed precision: enabled (16-mixed)")
     
     # Loop through all folds
     for FOLD_IDX in range(N_FOLDS):
@@ -74,8 +88,8 @@ def run():
         dm = PlayerReIDDataModuleCV(
         train_meta_path=train_meta_path,
         img_root=img_root,
-        batch_size=64,
-        num_workers=8,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
         train_ratio=0.8,
         bbox_mode="drop",
         image_size=224,
@@ -134,9 +148,13 @@ def run():
         callbacks=[ckpt_cb, lr_cb],
         logger=wandb_logger,
         log_every_n_steps=10,
+        accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
+        precision="16-mixed",  # Enable mixed precision training
         )
         logger.info(f"Max epochs: 12")
         logger.info(f"Accelerator: gpu, devices: 1")
+        logger.info(f"Gradient accumulation batches: {ACCUMULATE_GRAD_BATCHES}")
+        logger.info(f"Mixed precision: 16-mixed")
         logger.info(f"Log every n steps: 10")
 
         logger.info("\n" + "="*80)
@@ -149,6 +167,12 @@ def run():
         logger.info(f"Best checkpoint: {ckpt_cb.best_model_path}")
         logger.info(f"Best val/f1_macro: {ckpt_cb.best_model_score:.4f}")
         logger.info("="*80)
+        
+        # Clear GPU memory before next fold
+        import torch
+        del model, trainer, dm
+        torch.cuda.empty_cache()
+        logger.info("Cleared GPU memory")
         
         # ============================================================
         # Stage 2: Multi-View Fine-tuning (Optional)
@@ -257,6 +281,11 @@ def run():
             logger.info(f"Best checkpoint: {ckpt_cb_ft.best_model_path}")
             logger.info(f"Best val/f1_macro: {ckpt_cb_ft.best_model_score:.4f}")
             logger.info("="*80)
+            
+            # Clear GPU memory before next fold
+            del model_ft, trainer_ft, dm_mv
+            torch.cuda.empty_cache()
+            logger.info("Cleared GPU memory after fine-tuning")
     
     logger.info("\n" + "="*80)
     logger.info("ALL FOLDS TRAINING COMPLETE!")
